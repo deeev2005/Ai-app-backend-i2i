@@ -160,7 +160,7 @@ async def generate_image(
         logger.info(f"Image generated locally: {local_video_path}")
 
         # Upload image to Supabase storage
-        image_url = await _upload_image_to_supabase(local_video_path, sender_uid)
+        image_url = await _upload_media_to_supabase(local_video_path, sender_uid, "image")
         
         logger.info(f"Image uploaded to Supabase: {image_url}")
 
@@ -204,42 +204,49 @@ async def generate_image(
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
 
-async def _upload_image_to_supabase(local_image_path: str, sender_uid: str) -> str:
-    """Upload image to Supabase storage and return public URL"""
+async def _upload_media_to_supabase(local_media_path: str, sender_uid: str, media_type: str = "video") -> str:
+    """Upload media (video or image) to Supabase storage and return public URL"""
     try:
-        image_path = Path(local_image_path)
-        if not image_path.exists():
-            raise Exception(f"Image file not found: {local_image_path}")
-
-        # Determine file extension from the actual file
-        file_extension = image_path.suffix.lower()
-        if not file_extension or file_extension not in ['.jpg', '.jpeg', '.png', '.webp']:
-            file_extension = '.png'  # Default to PNG
+        media_path = Path(local_media_path)
+        if not media_path.exists():
+            raise Exception(f"Media file not found: {local_media_path}")
 
         # Generate unique filename for Supabase storage
-        image_id = str(uuid.uuid4())
-        storage_path = f"images/{sender_uid}/{image_id}{file_extension}"
+        media_id = str(uuid.uuid4())
+        
+        if media_type == "image":
+            # Determine file extension from the actual file
+            file_extension = media_path.suffix.lower()
+            if not file_extension or file_extension not in ['.jpg', '.jpeg', '.png', '.webp']:
+                file_extension = '.png'  # Default to PNG
+            
+            # Store directly in videos folder with image extension
+            storage_path = f"videos/{sender_uid}/{media_id}{file_extension}"
+            
+            # Determine content type based on extension
+            content_type_map = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg', 
+                '.png': 'image/png',
+                '.webp': 'image/webp'
+            }
+            content_type = content_type_map.get(file_extension, 'image/png')
+        else:
+            # Video file
+            storage_path = f"videos/{sender_uid}/{media_id}.mp4"
+            content_type = "video/mp4"
 
-        # Read image file
-        with open(image_path, "rb") as image_file:
-            image_data = image_file.read()
+        # Read media file
+        with open(media_path, "rb") as media_file:
+            media_data = media_file.read()
 
-        logger.info(f"Uploading image to Supabase: {storage_path}")
+        logger.info(f"Uploading {media_type} to Supabase: {storage_path}")
 
-        # Determine content type based on extension
-        content_type_map = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg', 
-            '.png': 'image/png',
-            '.webp': 'image/webp'
-        }
-        content_type = content_type_map.get(file_extension, 'image/png')
-
-        # Upload to Supabase storage
+        # Upload to Supabase storage (using same videos bucket)
         try:
-            result = supabase.storage.from_("images").upload(
+            result = supabase.storage.from_("videos").upload(
                 path=storage_path,
-                file=image_data,
+                file=media_data,
                 file_options={
                     "content-type": content_type,
                     "cache-control": "3600"
@@ -253,7 +260,7 @@ async def _upload_image_to_supabase(local_image_path: str, sender_uid: str) -> s
 
         # Get public URL
         try:
-            url_result = supabase.storage.from_("images").get_public_url(storage_path)
+            url_result = supabase.storage.from_("videos").get_public_url(storage_path)
             logger.info(f"Generated public URL: {url_result}")
             
             if not url_result:
@@ -266,7 +273,7 @@ async def _upload_image_to_supabase(local_image_path: str, sender_uid: str) -> s
             raise Exception(f"Failed to get public URL: {url_error}")
 
     except Exception as e:
-        logger.error(f"Failed to upload image to Supabase: {e}")
+        logger.error(f"Failed to upload {media_type} to Supabase: {e}")
         raise Exception(f"Storage upload failed: {str(e)}")
 
 async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, image_url: str, prompt: str):
@@ -400,8 +407,8 @@ def _predict_video(image_path: str, prompt: str):
             prompt=prompt,
             seed=0,
             randomize_seed=True,
-            guidance_scale=5,
-            steps=30,
+            guidance_scale=2.5,
+            steps=20,
             api_name="/infer"
         )
     except Exception as e:
