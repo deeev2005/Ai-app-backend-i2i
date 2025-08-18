@@ -387,8 +387,8 @@ def _predict_video(image_path: str, prompt: str):
             prompt=prompt,
             seed=0,
             randomize_seed=True,
-            guidance_scale=2.5,
-            steps=20,
+            guidance_scale=5,
+            steps=30,
             api_name="/infer"
         )
     except Exception as e:
