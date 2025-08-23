@@ -50,7 +50,7 @@ async def startup_event():
     global client, supabase
     try:
         logger.info("Initializing Gradio client...")
-        client = Client("mcp-tools/FLUX.1-Kontext-Dev", hf_token=HF_TOKEN)
+        client = Client("multimodalart/Qwen-Image-Edit-Fast", hf_token=HF_TOKEN)
         logger.info("Gradio client initialized successfully")
         
         logger.info("Initializing Supabase client...")
@@ -76,7 +76,7 @@ async def generate_image(
     sender_uid: str = Form(...),
     receiver_uids: str = Form(...)
 ):
-    """Generate image from image and prompt using FLUX.1 Kontext"""
+    """Generate image from image and prompt using Qwen-Image-Edit-Fast"""
     temp_image_path = None
     temp_video_path = None
     
@@ -143,11 +143,11 @@ async def generate_image(
         if supabase is None:
             raise HTTPException(status_code=503, detail="Storage service not available")
 
-        logger.info("Calling Hugging Face FLUX model...")
+        logger.info("Calling Hugging Face Qwen model...")
         
         # Run the prediction with asyncio timeout
         result = await asyncio.wait_for(
-            asyncio.to_thread(_predict_video, str(temp_image_path), prompt),
+            asyncio.to_thread(_predict_image, str(temp_image_path), prompt),
             timeout=300.0  # 5 minutes timeout
         )
 
@@ -399,16 +399,20 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
         # Don't raise exception here - image generation was successful
         # Just log the error and continue
 
-def _predict_video(image_path: str, prompt: str):
+def _predict_image(image_path: str, prompt: str):
     """Synchronous function to call the Gradio client for image generation"""
     try:
+        # Modify the prompt to preserve facial appearance
+        enhanced_prompt = f"{prompt} keep the facial appearance same do not change the face"
+        
         return client.predict(
-            input_image=handle_file(image_path),
-            prompt=prompt,
+            image=handle_file(image_path),
+            prompt=enhanced_prompt,
             seed=0,
             randomize_seed=True,
-            guidance_scale=5,
-            steps=30,
+            true_guidance_scale=2.8,
+            num_inference_steps=8,
+            rewrite_prompt=True,
             api_name="/infer"
         )
     except Exception as e:
