@@ -99,8 +99,12 @@ async def generate_image(
         if len(prompt.strip()) == 0:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
+        # Modify the prompt to include face preservation instruction
+        modified_prompt = f"{prompt} keep the facial appearance same do not change the face"
+
         logger.info(f"Starting image generation for user {sender_uid}")
-        logger.info(f"Prompt: {prompt}")
+        logger.info(f"Original Prompt: {prompt}")
+        logger.info(f"Modified Prompt: {modified_prompt}")
         logger.info(f"Receivers: {receiver_uids}")
         logger.info(f"File info - Content-Type: {content_type}, Filename: {filename}")
 
@@ -123,7 +127,7 @@ async def generate_image(
         try:
             with Image.open(temp_image_path) as img:
                 # Rotate 90 degrees clockwise (270 degrees counter-clockwise)
-                rotated_img = img.rotate(0, expand=True)
+                rotated_img = img.rotate(90, expand=True)
                 rotated_img.save(temp_image_path)
                 logger.info(f"Image rotated 90 degrees clockwise")
         except Exception as e:
@@ -145,9 +149,9 @@ async def generate_image(
 
         logger.info("Calling Hugging Face Qwen model...")
         
-        # Run the prediction with asyncio timeout
+        # Run the prediction with asyncio timeout using modified prompt
         result = await asyncio.wait_for(
-            asyncio.to_thread(_predict_video, str(temp_image_path), prompt),
+            asyncio.to_thread(_predict_video, str(temp_image_path), modified_prompt),
             timeout=300.0  # 5 minutes timeout
         )
 
