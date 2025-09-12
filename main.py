@@ -99,12 +99,8 @@ async def generate_image(
         if len(prompt.strip()) == 0:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
-        # Modify the prompt to include face preservation instruction
-        modified_prompt = f"{prompt} keep the facial appearance same do not change the face"
-
         logger.info(f"Starting image generation for user {sender_uid}")
-        logger.info(f"Original Prompt: {prompt}")
-        logger.info(f"Modified Prompt: {modified_prompt}")
+        logger.info(f"Prompt: {prompt}")
         logger.info(f"Receivers: {receiver_uids}")
         logger.info(f"File info - Content-Type: {content_type}, Filename: {filename}")
 
@@ -149,9 +145,9 @@ async def generate_image(
 
         logger.info("Calling Hugging Face Qwen model...")
         
-        # Run the prediction with asyncio timeout using modified prompt
+        # Run the prediction with asyncio timeout
         result = await asyncio.wait_for(
-            asyncio.to_thread(_predict_video, str(temp_image_path), modified_prompt),
+            asyncio.to_thread(_predict_image, str(temp_image_path), prompt),
             timeout=300.0  # 5 minutes timeout
         )
 
@@ -214,6 +210,18 @@ async def _upload_media_to_supabase(local_media_path: str, sender_uid: str, medi
         media_path = Path(local_media_path)
         if not media_path.exists():
             raise Exception(f"Media file not found: {local_media_path}")
+
+        # Rotate image 180 degrees before upload if it's an image
+        if media_type == "image":
+            from PIL import Image
+            try:
+                with Image.open(media_path) as img:
+                    # Rotate 180 degrees
+                    rotated_img = img.rotate(180, expand=True)
+                    rotated_img.save(media_path)
+                    logger.info(f"Image rotated 180 degrees before Supabase upload")
+            except Exception as e:
+                logger.warning(f"Failed to rotate image 180 degrees: {e}, proceeding with original image")
 
         # Generate unique filename for Supabase storage
         media_id = str(uuid.uuid4())
@@ -403,12 +411,15 @@ async def _save_chat_messages_to_firebase(sender_uid: str, receiver_list: list, 
         # Don't raise exception here - image generation was successful
         # Just log the error and continue
 
-def _predict_video(image_path: str, prompt: str):
+def _predict_image(image_path: str, prompt: str):
     """Synchronous function to call the Gradio client for image generation"""
     try:
+        # Modify the prompt to preserve facial appearance
+        enhanced_prompt = f"{prompt} keep the facial appearance same do not change the face"
+        
         return client.predict(
             image=handle_file(image_path),
-            prompt=prompt,
+            prompt=enhanced_prompt,
             seed=0,
             randomize_seed=True,
             true_guidance_scale=2.8,
