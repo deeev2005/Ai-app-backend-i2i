@@ -139,16 +139,19 @@ async def generate_image(
             content = await file.read()
             buffer.write(content)
 
-        # Rotate image 90 degrees clockwise to fix phone orientation
-        from PIL import Image
+        # Apply EXIF orientation to ensure photos reach API upright
+        from PIL import Image, ImageOps
         try:
             with Image.open(temp_image_path) as img:
-                # Rotate 90 degrees clockwise (270 degrees counter-clockwise)
-                rotated_img = img.rotate(90, expand=True)
-                rotated_img.save(temp_image_path)
-                logger.info(f"Image rotated 90 degrees clockwise")
+                # Apply EXIF orientation to correct rotation automatically
+                corrected_img = ImageOps.exif_transpose(img)
+                if corrected_img is None:
+                    # If no EXIF data, use original image
+                    corrected_img = img
+                corrected_img.save(temp_image_path)
+                logger.info(f"Image orientation corrected using EXIF data")
         except Exception as e:
-            logger.warning(f"Failed to rotate image: {e}, proceeding with original image")
+            logger.warning(f"Failed to correct image orientation: {e}, proceeding with original image")
 
         logger.info(f"Image saved to {temp_image_path}")
 
@@ -242,18 +245,6 @@ async def _upload_media_to_supabase(local_media_path: str, sender_uid: str, medi
         media_path = Path(local_media_path)
         if not media_path.exists():
             raise Exception(f"Media file not found: {local_media_path}")
-
-        # Rotate image 180 degrees before upload if it's an image
-        if media_type == "image":
-            from PIL import Image
-            try:
-                with Image.open(media_path) as img:
-                    # Rotate 180 degrees
-                    rotated_img = img.rotate(180, expand=True)
-                    rotated_img.save(media_path)
-                    logger.info(f"Image rotated 180 degrees before Supabase upload")
-            except Exception as e:
-                logger.warning(f"Failed to rotate image 180 degrees: {e}, proceeding with original image")
 
         # Generate unique filename for Supabase storage
         media_id = str(uuid.uuid4())
