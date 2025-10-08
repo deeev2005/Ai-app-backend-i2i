@@ -49,6 +49,10 @@ supabase: SupabaseClient = None
 request_queue = asyncio.Queue()
 queue_processing = False
 
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # seconds
+
 @app.on_event("startup")
 async def startup_event():
     global client, supabase
@@ -76,6 +80,7 @@ async def process_queue():
     logger.info("Queue processor is running...")
     
     while True:
+        queue_item = None
         try:
             # Get next request from queue
             queue_item = await request_queue.get()
@@ -85,24 +90,103 @@ async def process_queue():
             # Extract task data
             task_func = queue_item["task"]
             result_future = queue_item["future"]
+            retry_count = queue_item.get("retry_count", 0)
             
             try:
                 # Execute the task
                 result = await task_func()
                 # Set the result
-                result_future.set_result(result)
-                logger.info(f"Request completed successfully. Remaining queue: {request_queue.qsize()}")
-            except Exception as e:
-                # Set the exception
-                logger.error(f"Request failed in queue: {type(e).__name__}: {str(e)}")
-                result_future.set_exception(e)
-            finally:
-                # Mark task as done
-                request_queue.task_done()
+                if not result_future.done():
+                    result_future.set_result(result)
+                logger.info(f"✅ Request completed successfully. Remaining queue: {request_queue.qsize()}")
                 
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {str(e)}"
+                logger.error(f"❌ Request failed (attempt {retry_count + 1}/{MAX_RETRIES}): {error_msg}")
+                
+                # Check if we should retry
+                if retry_count < MAX_RETRIES - 1 and _should_retry(e):
+                    # Retry the request
+                    retry_count += 1
+                    logger.info(f"🔄 Retrying request after {RETRY_DELAY} seconds... (attempt {retry_count + 1}/{MAX_RETRIES})")
+                    
+                    await asyncio.sleep(RETRY_DELAY)
+                    
+                    # Re-add to queue with updated retry count
+                    retry_item = {
+                        "task": task_func,
+                        "future": result_future,
+                        "retry_count": retry_count
+                    }
+                    await request_queue.put(retry_item)
+                    logger.info(f"Request re-queued. New position: {request_queue.qsize()}")
+                else:
+                    # Max retries reached or non-retryable error
+                    if not result_future.done():
+                        result_future.set_exception(e)
+                    logger.error(f"❌ Request permanently failed after {retry_count + 1} attempts")
+                    
         except Exception as e:
-            logger.error(f"Error in queue processor: {e}", exc_info=True)
+            logger.error(f"Critical error in queue processor: {e}", exc_info=True)
+            if queue_item:
+                result_future = queue_item.get("future")
+                if result_future and not result_future.done():
+                    result_future.set_exception(Exception(f"Queue processor error: {str(e)}"))
             await asyncio.sleep(1)
+            
+        finally:
+            # Always mark task as done to prevent queue blocking
+            if queue_item:
+                request_queue.task_done()
+                logger.info(f"Task marked as done. Moving to next request.")
+
+def _should_retry(error: Exception) -> bool:
+    """Determine if an error is retryable"""
+    # Convert error to string for checking
+    error_str = str(error).lower()
+    error_type = type(error).__name__
+    
+    # Retryable errors
+    retryable_patterns = [
+        "timeout",
+        "connection",
+        "unavailable",
+        "busy",
+        "rate limit",
+        "overloaded",
+        "503",
+        "502",
+        "504"
+    ]
+    
+    # Non-retryable errors (don't waste retries on these)
+    non_retryable_patterns = [
+        "invalid",
+        "400",
+        "401",
+        "403",
+        "404",
+        "file not found",
+        "permission denied"
+    ]
+    
+    # Check non-retryable first
+    for pattern in non_retryable_patterns:
+        if pattern in error_str:
+            logger.info(f"Non-retryable error detected: {pattern}")
+            return False
+    
+    # Check retryable
+    for pattern in retryable_patterns:
+        if pattern in error_str:
+            logger.info(f"Retryable error detected: {pattern}")
+            return True
+    
+    # Default: retry on most errors (except HTTPException with 4xx)
+    if isinstance(error, HTTPException) and 400 <= error.status_code < 500:
+        return False
+    
+    return True
 
 async def add_to_queue(task_func):
     """Add a task to the queue and wait for its result"""
@@ -112,13 +196,14 @@ async def add_to_queue(task_func):
     # Add to queue
     queue_item = {
         "task": task_func,
-        "future": result_future
+        "future": result_future,
+        "retry_count": 0
     }
     
     await request_queue.put(queue_item)
     queue_position = request_queue.qsize()
     
-    logger.info(f"Request added to queue. Position: {queue_position}")
+    logger.info(f"📥 Request added to queue. Position: {queue_position}")
     
     # Wait for the result
     result = await result_future
@@ -132,7 +217,8 @@ async def health_check():
         "client_ready": client is not None,
         "supabase_ready": supabase is not None,
         "queue_size": request_queue.qsize(),
-        "queue_processing": queue_processing
+        "queue_processing": queue_processing,
+        "max_retries": MAX_RETRIES
     }
 
 def parse_prompt(prompt: str):
