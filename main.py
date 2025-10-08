@@ -45,6 +45,10 @@ app.add_middleware(
 client = None
 supabase: SupabaseClient = None
 
+# Queue system for GPU requests
+request_queue = asyncio.Queue()
+queue_processing = False
+
 @app.on_event("startup")
 async def startup_event():
     global client, supabase
@@ -56,9 +60,67 @@ async def startup_event():
         logger.info("Initializing Supabase client...")
         supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
         logger.info("Supabase client initialized successfully")
+        
+        # Start queue processor
+        asyncio.create_task(process_queue())
+        logger.info("Queue processor started")
     except Exception as e:
         logger.error(f"Failed to initialize clients: {e}")
         raise
+
+async def process_queue():
+    """Background task to process queued requests one at a time"""
+    global queue_processing
+    queue_processing = True
+    
+    logger.info("Queue processor is running...")
+    
+    while True:
+        try:
+            # Get next request from queue
+            queue_item = await request_queue.get()
+            
+            logger.info(f"Processing queued request. Queue size: {request_queue.qsize()}")
+            
+            # Extract task data
+            task_func = queue_item["task"]
+            result_future = queue_item["future"]
+            
+            try:
+                # Execute the task
+                result = await task_func()
+                # Set the result
+                result_future.set_result(result)
+            except Exception as e:
+                # Set the exception
+                result_future.set_exception(e)
+            finally:
+                # Mark task as done
+                request_queue.task_done()
+                
+        except Exception as e:
+            logger.error(f"Error in queue processor: {e}")
+            await asyncio.sleep(1)
+
+async def add_to_queue(task_func):
+    """Add a task to the queue and wait for its result"""
+    # Create a future to hold the result
+    result_future = asyncio.Future()
+    
+    # Add to queue
+    queue_item = {
+        "task": task_func,
+        "future": result_future
+    }
+    
+    await request_queue.put(queue_item)
+    queue_position = request_queue.qsize()
+    
+    logger.info(f"Request added to queue. Position: {queue_position}")
+    
+    # Wait for the result
+    result = await result_future
+    return result
 
 @app.get("/health")
 async def health_check():
@@ -66,7 +128,9 @@ async def health_check():
     return {
         "status": "healthy", 
         "client_ready": client is not None,
-        "supabase_ready": supabase is not None
+        "supabase_ready": supabase is not None,
+        "queue_size": request_queue.qsize(),
+        "queue_processing": queue_processing
     }
 
 def parse_prompt(prompt: str):
@@ -92,152 +156,165 @@ async def generate_image(
     receiver_uids: str = Form(...)
 ):
     """Generate image from image and prompt using Qwen-Image-Edit-Fast"""
-    temp_image_path = None
-    temp_video_path = None
     
-    try:
-        # Parse the prompt to extract magic prompt and caption
-        magic_prompt, caption = parse_prompt(prompt)
+    # Create task function that will be queued
+    async def process_task():
+        temp_image_path = None
+        temp_video_path = None
         
-        logger.info(f"Parsed prompt - Magic: '{magic_prompt}', Caption: '{caption}'")
-        
-        # Determine if we should skip API processing
-        skip_api = (magic_prompt == "" or magic_prompt is None)
-        
-        # Improved image validation
-        content_type = file.content_type or ""
-        filename = file.filename or ""
-        
-        # Check content type OR file extension
-        valid_content_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
-        valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
-        
-        is_valid_content_type = any(content_type.startswith(ct) for ct in ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/'])
-        is_valid_extension = any(filename.lower().endswith(ext) for ext in valid_extensions)
-        
-        if not (is_valid_content_type or is_valid_extension):
-            logger.warning(f"Invalid file - Content-Type: {content_type}, Filename: {filename}")
-            raise HTTPException(status_code=400, detail="File must be an image (jpg, png, webp)")
-
-        logger.info(f"Starting processing for user {sender_uid}")
-        logger.info(f"Original Prompt: {prompt}")
-        logger.info(f"Skip API: {skip_api}")
-        logger.info(f"Receivers: {receiver_uids}")
-        logger.info(f"File info - Content-Type: {content_type}, Filename: {filename}")
-
-        # Create temp directory if it doesn't exist
-        temp_dir = Path("/tmp")
-        temp_dir.mkdir(exist_ok=True)
-
-        # Save uploaded image temporarily
-        image_id = str(uuid.uuid4())
-        file_extension = Path(filename).suffix or '.jpg'
-        temp_image_path = temp_dir / f"{image_id}{file_extension}"
-
-        # Save file
-        with open(temp_image_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-
-        # Apply EXIF orientation to ensure photos reach API upright
-        from PIL import Image, ImageOps
         try:
-            with Image.open(temp_image_path) as img:
-                # Apply EXIF orientation to correct rotation automatically
-                corrected_img = ImageOps.exif_transpose(img)
-                if corrected_img is None:
-                    # If no EXIF data, use original image
-                    corrected_img = img
-                corrected_img.save(temp_image_path)
-                logger.info(f"Image orientation corrected using EXIF data")
-        except Exception as e:
-            logger.warning(f"Failed to correct image orientation: {e}, proceeding with original image")
-
-        logger.info(f"Image saved to {temp_image_path}")
-
-        # Validate file size (optional)
-        file_size = temp_image_path.stat().st_size
-        if file_size > 10 * 1024 * 1024:  # 10MB limit
-            raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
-        # Check if Supabase is available
-        if supabase is None:
-            raise HTTPException(status_code=503, detail="Storage service not available")
-
-        image_url = None
-        
-        if skip_api:
-            # Skip API processing, upload image directly to Supabase
-            logger.info("Skipping API processing, uploading image directly to Supabase")
-            image_url = await _upload_media_to_supabase(str(temp_image_path), sender_uid, "image")
-            logger.info(f"Image uploaded to Supabase: {image_url}")
-        else:
-            # Process with API
-            # Check if client is available
-            if client is None:
-                raise HTTPException(status_code=503, detail="AI service not available")
-
-            logger.info("Calling Hugging Face Qwen model...")
+            # Parse the prompt to extract magic prompt and caption
+            magic_prompt, caption = parse_prompt(prompt)
             
-            # Run the prediction with asyncio timeout
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_predict_image, str(temp_image_path), magic_prompt),
-                timeout=300.0  # 5 minutes timeout
+            logger.info(f"Parsed prompt - Magic: '{magic_prompt}', Caption: '{caption}'")
+            
+            # Determine if we should skip API processing
+            skip_api = (magic_prompt == "" or magic_prompt is None)
+            
+            # Improved image validation
+            content_type = file.content_type or ""
+            filename = file.filename or ""
+            
+            # Check content type OR file extension
+            valid_content_types = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp']
+            valid_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+            
+            is_valid_content_type = any(content_type.startswith(ct) for ct in ['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/'])
+            is_valid_extension = any(filename.lower().endswith(ext) for ext in valid_extensions)
+            
+            if not (is_valid_content_type or is_valid_extension):
+                logger.warning(f"Invalid file - Content-Type: {content_type}, Filename: {filename}")
+                raise HTTPException(status_code=400, detail="File must be an image (jpg, png, webp)")
+
+            logger.info(f"Starting processing for user {sender_uid}")
+            logger.info(f"Original Prompt: {prompt}")
+            logger.info(f"Skip API: {skip_api}")
+            logger.info(f"Receivers: {receiver_uids}")
+            logger.info(f"File info - Content-Type: {content_type}, Filename: {filename}")
+
+            # Create temp directory if it doesn't exist
+            temp_dir = Path("/tmp")
+            temp_dir.mkdir(exist_ok=True)
+
+            # Save uploaded image temporarily
+            image_id = str(uuid.uuid4())
+            file_extension = Path(filename).suffix or '.jpg'
+            temp_image_path = temp_dir / f"{image_id}{file_extension}"
+
+            # Save file
+            with open(temp_image_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+
+            # Apply EXIF orientation to ensure photos reach API upright
+            from PIL import Image, ImageOps
+            try:
+                with Image.open(temp_image_path) as img:
+                    # Apply EXIF orientation to correct rotation automatically
+                    corrected_img = ImageOps.exif_transpose(img)
+                    if corrected_img is None:
+                        # If no EXIF data, use original image
+                        corrected_img = img
+                    corrected_img.save(temp_image_path)
+                    logger.info(f"Image orientation corrected using EXIF data")
+            except Exception as e:
+                logger.warning(f"Failed to correct image orientation: {e}, proceeding with original image")
+
+            logger.info(f"Image saved to {temp_image_path}")
+
+            # Validate file size (optional)
+            file_size = temp_image_path.stat().st_size
+            if file_size > 10 * 1024 * 1024:  # 10MB limit
+                raise HTTPException(status_code=400, detail="File too large (max 10MB)")
+
+            # Check if Supabase is available
+            if supabase is None:
+                raise HTTPException(status_code=503, detail="Storage service not available")
+
+            image_url = None
+            
+            if skip_api:
+                # Skip API processing, upload image directly to Supabase
+                logger.info("Skipping API processing, uploading image directly to Supabase")
+                image_url = await _upload_media_to_supabase(str(temp_image_path), sender_uid, "image")
+                logger.info(f"Image uploaded to Supabase: {image_url}")
+            else:
+                # Process with API
+                # Check if client is available
+                if client is None:
+                    raise HTTPException(status_code=503, detail="AI service not available")
+
+                logger.info("Calling Hugging Face Qwen model...")
+                
+                # Run the prediction with asyncio timeout
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(_predict_image, str(temp_image_path), magic_prompt),
+                    timeout=300.0  # 5 minutes timeout
+                )
+
+                if not result or len(result) < 2:
+                    raise HTTPException(status_code=500, detail="Invalid response from AI model")
+
+                local_video_path = result[0].get("path") if isinstance(result[0], dict) else result[0]
+                seed_used = result[1] if len(result) > 1 else "unknown"
+
+                logger.info(f"Image generated locally: {local_video_path}")
+
+                # Upload image to Supabase storage
+                image_url = await _upload_media_to_supabase(local_video_path, sender_uid, "image")
+                
+                logger.info(f"Image uploaded to Supabase: {image_url}")
+
+            # Save chat messages to Firebase for each receiver
+            receiver_list = [uid.strip() for uid in receiver_uids.split(",") if uid.strip()]
+            await _save_chat_messages_to_firebase(sender_uid, receiver_list, image_url, magic_prompt or "", caption, skip_api)
+
+            return {
+                "success": True,
+                "image_url": image_url,
+                "sender_uid": sender_uid,
+                "receiver_uids": receiver_list,
+                "caption": caption,
+                "skipped_api": skip_api
+            }
+
+        except asyncio.TimeoutError:
+            logger.error("Image generation timed out after 5 minutes")
+            raise HTTPException(
+                status_code=408, 
+                detail="Image generation timed out. Please try with a simpler prompt or smaller image."
             )
-
-            if not result or len(result) < 2:
-                raise HTTPException(status_code=500, detail="Invalid response from AI model")
-
-            local_video_path = result[0].get("path") if isinstance(result[0], dict) else result[0]
-            seed_used = result[1] if len(result) > 1 else "unknown"
-
-            logger.info(f"Image generated locally: {local_video_path}")
-
-            # Upload image to Supabase storage
-            image_url = await _upload_media_to_supabase(local_video_path, sender_uid, "image")
-            
-            logger.info(f"Image uploaded to Supabase: {image_url}")
-
-        # Save chat messages to Firebase for each receiver
-        receiver_list = [uid.strip() for uid in receiver_uids.split(",") if uid.strip()]
-        await _save_chat_messages_to_firebase(sender_uid, receiver_list, image_url, magic_prompt or "", caption, skip_api)
-
-        return JSONResponse({
-            "success": True,
-            "image_url": image_url,
-            "sender_uid": sender_uid,
-            "receiver_uids": receiver_list,
-            "caption": caption,
-            "skipped_api": skip_api
-        })
-
-    except asyncio.TimeoutError:
-        logger.error("Image generation timed out after 5 minutes")
-        raise HTTPException(
-            status_code=408, 
-            detail="Image generation timed out. Please try with a simpler prompt or smaller image."
-        )
+        
+        except HTTPException:
+            # Re-raise HTTP exceptions
+            raise
+        
+        except Exception as e:
+            logger.error(f"Error generating video: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate image: {str(e)}"
+            )
+        
+        finally:
+            # Cleanup temporary files
+            for temp_path in [temp_image_path, temp_video_path]:
+                if temp_path and Path(temp_path).exists():
+                    try:
+                        Path(temp_path).unlink()
+                        logger.info(f"Cleaned up temp file: {temp_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
     
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    
+    # Add task to queue and wait for result
+    try:
+        result = await add_to_queue(process_task)
+        return JSONResponse(result)
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        logger.error(f"Error generating video: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to generate image: {str(e)}"
-        )
-    
-    finally:
-        # Cleanup temporary files
-        for temp_path in [temp_image_path, temp_video_path]:
-            if temp_path and Path(temp_path).exists():
-                try:
-                    Path(temp_path).unlink()
-                    logger.info(f"Cleaned up temp file: {temp_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to cleanup temp file {temp_path}: {e}")
+        logger.error(f"Queue task failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 async def _upload_media_to_supabase(local_media_path: str, sender_uid: str, media_type: str = "video") -> str:
     """Upload media (video or image) to Supabase storage and return public URL"""
