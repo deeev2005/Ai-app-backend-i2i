@@ -91,15 +91,17 @@ async def process_queue():
                 result = await task_func()
                 # Set the result
                 result_future.set_result(result)
+                logger.info(f"Request completed successfully. Remaining queue: {request_queue.qsize()}")
             except Exception as e:
                 # Set the exception
+                logger.error(f"Request failed in queue: {type(e).__name__}: {str(e)}")
                 result_future.set_exception(e)
             finally:
                 # Mark task as done
                 request_queue.task_done()
                 
         except Exception as e:
-            logger.error(f"Error in queue processor: {e}")
+            logger.error(f"Error in queue processor: {e}", exc_info=True)
             await asyncio.sleep(1)
 
 async def add_to_queue(task_func):
@@ -529,7 +531,9 @@ def _predict_image(image_path: str, prompt: str):
         # Modify the prompt to preserve facial appearance
         enhanced_prompt = f"{prompt} keep the facial appearance same do not change the face"
         
-        return client.predict(
+        logger.info(f"Calling Gradio API with enhanced prompt: {enhanced_prompt}")
+        
+        result = client.predict(
             image=handle_file(image_path),
             prompt=enhanced_prompt,
             seed=0,
@@ -539,9 +543,13 @@ def _predict_image(image_path: str, prompt: str):
             rewrite_prompt=True,
             api_name="/infer"
         )
+        
+        logger.info(f"Gradio API returned successfully")
+        return result
+        
     except Exception as e:
-        logger.error(f"Gradio client prediction failed: {e}")
-        raise
+        logger.error(f"Gradio client prediction failed: {type(e).__name__}: {str(e)}", exc_info=True)
+        raise Exception(f"AI model prediction failed: {str(e)}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
